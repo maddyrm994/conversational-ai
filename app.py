@@ -105,7 +105,7 @@ def listen_and_transcribe(status_placeholder):
 def generate_response(user_text):
     """Generates a response using the Groq API."""
     st.info("💡 Getting response from AI...")
-    system_prompt = "You are a helpful and friendly voice assistant. Your name is Jarvis. Keep your responses concise, conversational, and suitable for being spoken aloud."
+    system_prompt = "You are a helpful and friendly voice assistant. Your name is AI. Keep your responses concise, conversational, and suitable for being spoken aloud."
     try:
         chat_completion = client.chat.completions.create(
             messages=[
