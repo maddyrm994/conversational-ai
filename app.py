@@ -13,8 +13,10 @@ import av
 
 # --- INITIALIZATION & SETUP ---
 
-# Use a thread-safe queue to pass audio chunks from the WebRTC thread to the main thread.
-audio_frames_queue = queue.Queue()
+# Use a thread-safe queue to pass audio frames from the WebRTC thread to the main thread.
+# We need to check if the queue already exists in the session state to avoid re-creating it on every run.
+if "audio_frames_queue" not in st.session_state:
+    st.session_state.audio_frames_queue = queue.Queue()
 
 # VOSK Model Loading
 @st.cache_resource
@@ -80,12 +82,10 @@ def generate_response(user_text):
         return "Sorry, I'm having trouble connecting to my brain right now."
 
 # --- WEBRTC AUDIO PROCESSOR ---
-# This class now only has one job: put raw audio frames into the thread-safe queue.
 class AudioProcessor(AudioProcessorBase):
     def recv(self, frame: av.AudioFrame):
-        # We're not processing here to avoid blocking the real-time audio thread.
-        # Just put the raw frame into the queue.
-        audio_frames_queue.put(frame)
+        # Put the raw audio frame into our thread-safe queue
+        st.session_state.audio_frames_queue.put(frame)
         return frame
 
 # --- STREAMLIT UI ---
@@ -96,10 +96,13 @@ st.set_page_config(layout="wide", page_title="AI Voice Assistant (Cloud)")
 col1, col2 = st.columns([5, 1])
 with col1:
     st.title("️🎙️ AI Voice Assistant (Cloud Version)")
-    st.markdown("This version runs on the cloud. Click 'Start Recording' and allow microphone access.")
+    st.markdown("This version runs on the cloud. Click 'START' in the box below and allow microphone access.")
 with col2:
     if st.button("Clear Chat 🗑️", use_container_width=True):
         st.session_state.history = []
+        # Clear the queue as well
+        while not st.session_state.audio_frames_queue.empty():
+            st.session_state.audio_frames_queue.get()
         st.rerun()
 
 # Display conversation history
@@ -115,11 +118,10 @@ audio_player_placeholder = st.empty()
 # The WebRTC component that accesses the microphone
 webrtc_ctx = webrtc_streamer(
     key="audio-recorder",
-    mode=WebRtcMode.SEND_ONLY,
+    # THIS IS THE CORRECTED LINE:
+    mode=WebRtcMode.SENDONLY,
     audio_processor_factory=AudioProcessor,
-    media_stream_constraints={"video": False, "audio": True},
     client_settings=ClientSettings(
-        # This is important for NAT traversal
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         media_stream_constraints={"video": False, "audio": True},
     ),
@@ -127,25 +129,23 @@ webrtc_ctx = webrtc_streamer(
 )
 
 if webrtc_ctx.state.playing and not st.session_state.run_conversation:
-    status_placeholder.info("🎙️ Microphone is active. Press 'Stop and Process' when you're done speaking.")
-    
+    status_placeholder.info("🎙️ Microphone is active. Speak your message, then press 'Stop and Process'.")
     if st.button("🛑 Stop and Process", type="primary", use_container_width=True):
         st.session_state.run_conversation = True
+        st.rerun()
 
 elif not webrtc_ctx.state.playing:
-    status_placeholder.warning("🎤 Microphone is off. Please click 'START' in the box above and allow access.")
+    status_placeholder.warning("🎤 Microphone is off. Please click 'START' in the component box above to activate it.")
 
 # This block runs only AFTER "Stop and Process" is clicked
 if st.session_state.run_conversation:
     status_placeholder.info("Processing audio...")
-
-    # Pull all audio frames from the queue
+    
     audio_frames = []
-    while not audio_frames_queue.empty():
-        audio_frames.append(audio_frames_queue.get())
+    while not st.session_state.audio_frames_queue.empty():
+        audio_frames.append(st.session_state.audio_frames_queue.get())
     
     if audio_frames:
-        # Combine frames and convert to format Vosk understands
         full_audio_segment = pydub.AudioSegment.empty()
         for frame in audio_frames:
             sound = pydub.AudioSegment(
@@ -157,11 +157,9 @@ if st.session_state.run_conversation:
             full_audio_segment += sound
 
         if len(full_audio_segment) > 0:
-            # Downsample to 16kHz for Vosk
             full_audio_segment = full_audio_segment.set_channels(1).set_frame_rate(16000)
             audio_data = full_audio_segment.raw_data
 
-            # Transcribe
             with st.spinner("Transcribing your speech..."):
                 recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
                 recognizer.AcceptWaveform(audio_data)
@@ -185,18 +183,15 @@ if st.session_state.run_conversation:
             else:
                 st.warning("No speech was detected. Please try again.")
                 st.session_state.run_conversation = False
-                time.sleep(3)
-                st.rerun()
+                time.sleep(3); st.rerun()
         else:
             st.warning("No audio was captured. Please try again.")
             st.session_state.run_conversation = False
-            time.sleep(3)
-            st.rerun()
+            time.sleep(3); st.rerun()
     else:
         st.warning("Audio buffer is empty. Please try recording again.")
         st.session_state.run_conversation = False
-        time.sleep(3)
-        st.rerun()
+        time.sleep(3); st.rerun()
 
 # Sidebar
 st.sidebar.header("About")
