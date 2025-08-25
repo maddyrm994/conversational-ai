@@ -34,7 +34,7 @@ try:
     api_key = st.secrets["GROQ_API_KEY"]
     client = Groq(api_key=api_key)
 except KeyError:
-    st.error("Groq API key not found. Please add it to your Streamlit secrets.")
+    st.error("Groq API key not in secrets.toml.")
     st.stop()
 
 # --- SESSION STATE ---
@@ -46,7 +46,6 @@ if "run_conversation" not in st.session_state:
 # --- AUDIO & AI FUNCTIONS ---
 
 def text_to_audio_autoplay(text):
-    """Converts text to an audio file and returns HTML for autoplaying it."""
     try:
         tts = gTTS(text=text, lang='en', slow=False)
         mp3_fp = io.BytesIO()
@@ -83,7 +82,6 @@ def generate_response(user_text):
 # --- WEBRTC AUDIO PROCESSOR ---
 class AudioProcessor(AudioProcessorBase):
     def recv(self, frame: av.AudioFrame):
-        # Put the raw audio frame into our thread-safe queue
         st.session_state.audio_frames_queue.put(frame)
         return frame
 
@@ -91,18 +89,16 @@ class AudioProcessor(AudioProcessorBase):
 
 st.set_page_config(layout="wide", page_title="AI Voice Assistant (Cloud)")
 
-# --- UI for Title and Clear Chat Button ---
 col1, col2 = st.columns([5, 1])
 with col1:
     st.title("️🎙️ AI Voice Assistant (Cloud Version)")
-    st.markdown("This version runs on the cloud. Click 'START' in the box below and allow microphone access.")
+    st.markdown("Click 'START' in the box below and allow microphone access.")
 with col2:
     if st.button("Clear Chat 🗑️", use_container_width=True):
         st.session_state.history = []
-        # Clear the queue as well
         while not st.session_state.audio_frames_queue.empty():
             st.session_state.audio_frames_queue.get()
-        st.rerun()
+        st.experimental_rerun() # CORRECTED
 
 # Display conversation history
 for user_msg, ai_msg in st.session_state.history:
@@ -114,7 +110,6 @@ for user_msg, ai_msg in st.session_state.history:
 status_placeholder = st.empty()
 audio_player_placeholder = st.empty()
 
-# The WebRTC component that accesses the microphone
 webrtc_ctx = webrtc_streamer(
     key="audio-recorder",
     mode=WebRtcMode.SENDONLY,
@@ -123,19 +118,17 @@ webrtc_ctx = webrtc_streamer(
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         media_stream_constraints={"video": False, "audio": True},
     ),
-    # The 'send_interval' argument has been removed from this call
 )
 
 if webrtc_ctx.state.playing and not st.session_state.run_conversation:
-    status_placeholder.info("🎙️ Microphone is active. Speak your message, then press 'Stop and Process'.")
+    status_placeholder.info("🎙️ Microphone is active. Speak, then press 'Stop and Process'.")
     if st.button("🛑 Stop and Process", type="primary", use_container_width=True):
         st.session_state.run_conversation = True
-        st.rerun()
+        st.experimental_rerun() # CORRECTED
 
 elif not webrtc_ctx.state.playing:
     status_placeholder.warning("🎤 Microphone is off. Please click 'START' in the component box above to activate it.")
 
-# This block runs only AFTER "Stop and Process" is clicked
 if st.session_state.run_conversation:
     status_placeholder.info("Processing audio...")
     
@@ -177,20 +170,19 @@ if st.session_state.run_conversation:
                 
                 st.session_state.run_conversation = False
                 time.sleep(1) 
-                st.rerun()
+                st.experimental_rerun() # CORRECTED
             else:
                 st.warning("No speech was detected. Please try again.")
                 st.session_state.run_conversation = False
-                time.sleep(3); st.rerun()
+                time.sleep(3); st.experimental_rerun() # CORRECTED
         else:
             st.warning("No audio was captured. Please try again.")
             st.session_state.run_conversation = False
-            time.sleep(3); st.rerun()
+            time.sleep(3); st.experimental_rerun() # CORRECTED
     else:
         st.warning("Audio buffer is empty. Please try recording again.")
         st.session_state.run_conversation = False
-        time.sleep(3); st.rerun()
+        time.sleep(3); st.experimental_rerun() # CORRECTED
 
-# Sidebar
 st.sidebar.header("About")
-st.sidebar.info("This is the cloud-ready version of the AI Voice Assistant, using thread-safe data handling for stability.")
+st.sidebar.info("This is the cloud-ready version of the AI Voice Assistant.")
