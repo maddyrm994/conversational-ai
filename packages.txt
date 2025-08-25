@@ -1,4 +1,1 @@
-build-essential
-portaudio19-dev
-espeak-ng
 ffmpeg
