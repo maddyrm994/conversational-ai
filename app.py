@@ -1,5 +1,5 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode, ClientSettings
 from groq import Groq
 import vosk
 import json
@@ -8,8 +8,13 @@ import io
 import time
 from gtts import gTTS
 import base64
+import queue
+import av
 
-# --- INITIALIZATION ---
+# --- INITIALIZATION & SETUP ---
+
+# Use a thread-safe queue to pass audio chunks from the WebRTC thread to the main thread.
+audio_frames_queue = queue.Queue()
 
 # VOSK Model Loading
 @st.cache_resource
@@ -18,7 +23,7 @@ def load_vosk_model():
     try:
         return vosk.Model(model_path)
     except Exception as e:
-        st.error(f"Failed to load Vosk model from {model_path}. Ensure it's in your repo. Error: {e}")
+        st.error(f"Failed to load Vosk model. Error: {e}")
         return None
 
 vosk_model = load_vosk_model()
@@ -34,28 +39,23 @@ except KeyError:
 # --- SESSION STATE ---
 if "history" not in st.session_state:
     st.session_state.history = []
-if "audio_buffer" not in st.session_state:
-    st.session_state.audio_buffer = b""
-if "transcribed_text" not in st.session_state:
-    st.session_state.transcribed_text = ""
-if "processing" not in st.session_state:
-    st.session_state.processing = False
+if "run_conversation" not in st.session_state:
+    st.session_state.run_conversation = False
 
 # --- AUDIO & AI FUNCTIONS ---
 
 def text_to_audio_autoplay(text):
     """Converts text to an audio file and returns HTML for autoplaying it."""
     try:
-        tts = gTTS(text=text, lang='en')
+        tts = gTTS(text=text, lang='en', slow=False)
         mp3_fp = io.BytesIO()
         tts.write_to_fp(mp3_fp)
         mp3_fp.seek(0)
-        # Encode to base64
         b64 = base64.b64encode(mp3_fp.read()).decode()
-        # Create the HTML audio player
         audio_html = f"""
             <audio autoplay="true">
             <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+            Your browser does not support the audio element.
             </audio>
             """
         return audio_html
@@ -80,31 +80,12 @@ def generate_response(user_text):
         return "Sorry, I'm having trouble connecting to my brain right now."
 
 # --- WEBRTC AUDIO PROCESSOR ---
-
+# This class now only has one job: put raw audio frames into the thread-safe queue.
 class AudioProcessor(AudioProcessorBase):
-    def __init__(self):
-        self.audio_buffer = b""
-        self.vosk_recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
-
-    def recv(self, frame):
-        # The frame comes from the browser. Convert it to the right format for Vosk.
-        # This assumes the browser sends audio at 48kHz. We'll downsample to 16kHz.
-        try:
-            audio = pydub.AudioSegment.from_raw(
-                io.BytesIO(frame.to_ndarray().tobytes()),
-                sample_width=frame.format.bytes,
-                frame_rate=frame.sample_rate,
-                channels=len(frame.layout.channels),
-            )
-            audio = audio.set_channels(1).set_frame_rate(16000)
-            
-            # Append to buffer if recording is active
-            if st.session_state.get("is_recording", False):
-                st.session_state.audio_buffer += audio.raw_data
-
-        except Exception as e:
-            st.error(f"Error processing audio frame: {e}")
-        
+    def recv(self, frame: av.AudioFrame):
+        # We're not processing here to avoid blocking the real-time audio thread.
+        # Just put the raw frame into the queue.
+        audio_frames_queue.put(frame)
         return frame
 
 # --- STREAMLIT UI ---
@@ -119,7 +100,6 @@ with col1:
 with col2:
     if st.button("Clear Chat 🗑️", use_container_width=True):
         st.session_state.history = []
-        st.session_state.transcribed_text = ""
         st.rerun()
 
 # Display conversation history
@@ -129,80 +109,95 @@ for user_msg, ai_msg in st.session_state.history:
     with st.chat_message("assistant"):
         st.write(ai_msg)
 
-# Placeholder for status and audio player
 status_placeholder = st.empty()
 audio_player_placeholder = st.empty()
 
 # The WebRTC component that accesses the microphone
-# It's always "running" in the background, but we control data collection with a session state flag.
 webrtc_ctx = webrtc_streamer(
     key="audio-recorder",
     mode=WebRtcMode.SEND_ONLY,
     audio_processor_factory=AudioProcessor,
     media_stream_constraints={"video": False, "audio": True},
+    client_settings=ClientSettings(
+        # This is important for NAT traversal
+        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        media_stream_constraints={"video": False, "audio": True},
+    ),
+    send_interval=200, # Send audio chunks every 200ms
 )
 
-# --- Main Interaction Logic ---
-# Control buttons
-c1, c2 = st.columns(2)
-with c1:
-    if not st.session_state.get("is_recording", False):
-        if st.button("🎤 Start Recording", type="primary", use_container_width=True):
-            st.session_state.is_recording = True
-            st.session_state.audio_buffer = b"" # Reset buffer
-            st.rerun()
-    else:
-        if st.button("🛑 Stop Recording", type="secondary", use_container_width=True):
-            st.session_state.is_recording = False
-            st.session_state.processing = True
-            st.rerun()
+if webrtc_ctx.state.playing and not st.session_state.run_conversation:
+    status_placeholder.info("🎙️ Microphone is active. Press 'Stop and Process' when you're done speaking.")
+    
+    if st.button("🛑 Stop and Process", type="primary", use_container_width=True):
+        st.session_state.run_conversation = True
 
-if st.session_state.get("is_recording", False):
-    status_placeholder.info("🎙️ Recording... Click 'Stop Recording' when you're done.")
+elif not webrtc_ctx.state.playing:
+    status_placeholder.warning("🎤 Microphone is off. Please click 'START' in the box above and allow access.")
 
-# This block runs AFTER "Stop Recording" is clicked
-if st.session_state.get("processing", False):
-    with status_placeholder.container():
-        with st.spinner("Transcribing your speech..."):
-            if st.session_state.audio_buffer and vosk_model:
+# This block runs only AFTER "Stop and Process" is clicked
+if st.session_state.run_conversation:
+    status_placeholder.info("Processing audio...")
+
+    # Pull all audio frames from the queue
+    audio_frames = []
+    while not audio_frames_queue.empty():
+        audio_frames.append(audio_frames_queue.get())
+    
+    if audio_frames:
+        # Combine frames and convert to format Vosk understands
+        full_audio_segment = pydub.AudioSegment.empty()
+        for frame in audio_frames:
+            sound = pydub.AudioSegment(
+                data=frame.to_ndarray().tobytes(),
+                sample_width=frame.format.bytes,
+                frame_rate=frame.sample_rate,
+                channels=len(frame.layout.channels),
+            )
+            full_audio_segment += sound
+
+        if len(full_audio_segment) > 0:
+            # Downsample to 16kHz for Vosk
+            full_audio_segment = full_audio_segment.set_channels(1).set_frame_rate(16000)
+            audio_data = full_audio_segment.raw_data
+
+            # Transcribe
+            with st.spinner("Transcribing your speech..."):
                 recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
-                recognizer.AcceptWaveform(st.session_state.audio_buffer)
+                recognizer.AcceptWaveform(audio_data)
                 result_json = recognizer.FinalResult()
                 result_dict = json.loads(result_json)
-                st.session_state.transcribed_text = result_dict.get("text", "").strip()
+                transcribed_text = result_dict.get("text", "").strip()
+
+            if transcribed_text:
+                st.success(f"Transcription: '{transcribed_text}'")
+                with st.spinner("Generating AI response..."):
+                    ai_response = generate_response(transcribed_text)
+                
+                st.session_state.history.append((transcribed_text, ai_response))
+                audio_html = text_to_audio_autoplay(ai_response)
+                if audio_html:
+                    audio_player_placeholder.markdown(audio_html, unsafe_allow_html=True)
+                
+                st.session_state.run_conversation = False
+                time.sleep(1) 
+                st.rerun()
             else:
-                st.session_state.transcribed_text = ""
-
-        if st.session_state.transcribed_text:
-            st.success(f"Transcription: '{st.session_state.transcribed_text}'")
-            with st.spinner("Generating AI response..."):
-                ai_response = generate_response(st.session_state.transcribed_text)
-            
-            # Add to history and generate audio
-            st.session_state.history.append((st.session_state.transcribed_text, ai_response))
-            audio_html = text_to_audio_autoplay(ai_response)
-            if audio_html:
-                audio_player_placeholder.markdown(audio_html, unsafe_allow_html=True)
-            
-            # Reset states for the next turn
-            st.session_state.transcribed_text = ""
-            st.session_state.audio_buffer = b""
-            st.session_state.processing = False
-            time.sleep(1) # Give a moment for audio to start playing
-            st.rerun()
+                st.warning("No speech was detected. Please try again.")
+                st.session_state.run_conversation = False
+                time.sleep(3)
+                st.rerun()
         else:
-            st.warning("No speech was detected. Please try recording again.")
-            st.session_state.processing = False
-            time.sleep(2)
+            st.warning("No audio was captured. Please try again.")
+            st.session_state.run_conversation = False
+            time.sleep(3)
             st.rerun()
+    else:
+        st.warning("Audio buffer is empty. Please try recording again.")
+        st.session_state.run_conversation = False
+        time.sleep(3)
+        st.rerun()
 
-# Sidebar Information
+# Sidebar
 st.sidebar.header("About")
-st.sidebar.info(
-    "This app uses a web-friendly architecture:\n"
-    "1. **Mic Access:** `streamlit-webrtc` (in browser)\n"
-    "2. **Speech-to-Text:** `Vosk` (on server)\n"
-    "3. **LLM Inference:** `Groq API`\n"
-    "4. **Text-to-Speech:** `gTTS` (generates audio on server)\n"
-    "5. **Audio Playback:** HTML5 Audio (in browser)"
-)
+st.sidebar.info("This is the cloud-ready version of the AI Voice Assistant, using thread-safe data handling for stability.")
