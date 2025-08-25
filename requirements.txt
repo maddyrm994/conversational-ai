@@ -1,6 +1,6 @@
 streamlit
-SpeechRecognition
-pyaudio
-pyttsx3
 groq
 vosk
+streamlit-webrtc
+pydub
+gTTS
