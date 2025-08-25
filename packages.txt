@@ -1,0 +1,6 @@
+# For PyAudio to compile
+portaudio19-dev
+# For pyttsx3 to speak on Linux
+espeak
+# A common audio/video utility that can be useful
+ffmpeg
