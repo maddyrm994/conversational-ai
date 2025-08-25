@@ -1,6 +1,7 @@
 streamlit
 groq
 vosk
-streamlit-webrtc
+streamlit-webrtc==0.47.0
 pydub
 gTTS
+av
