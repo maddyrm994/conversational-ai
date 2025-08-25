@@ -1,162 +1,208 @@
 import streamlit as st
-import speech_recognition as sr
-import pyttsx3
-import time
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase, WebRtcMode
 from groq import Groq
+import vosk
 import json
-from vosk import Model, KaldiRecognizer
-import multiprocessing
+import pydub
+import io
+import time
+from gtts import gTTS
+import base64
 
-# --- TTS Subprocess Target Function ---
-# This function will run in a separate process.
-# It MUST be a top-level function and cannot use Streamlit objects like st.error.
-def tts_subprocess_target(text_to_speak):
-    """
-    Initializes a TTS engine in a new process, speaks the text, and terminates.
-    """
-    try:
-        engine = pyttsx3.init()
-        engine.say(text_to_speak)
-        engine.runAndWait()
-        engine.stop()
-    except Exception as e:
-        # If something goes wrong in the subprocess, print to the console.
-        print(f"Error in TTS subprocess: {e}")
+# --- INITIALIZATION ---
 
-# --- Main App Functions ---
-
-# We now have a new speak_text function that launches the subprocess
-def speak_text(text):
-    """
-    Launches a separate process to handle text-to-speech.
-    """
-    p = multiprocessing.Process(target=tts_subprocess_target, args=(text,))
-    p.start()
-    # We don't call p.join(), allowing the Streamlit app to continue running.
-
+# VOSK Model Loading
 @st.cache_resource
 def load_vosk_model():
     model_path = "model/vosk-model-small-en-us-0.15"
     try:
-        return Model(model_path)
-    except Exception:
-        st.error("Failed to load Speech-To-Text model. Ensure it's in the 'model' directory.")
+        return vosk.Model(model_path)
+    except Exception as e:
+        st.error(f"Failed to load Vosk model from {model_path}. Ensure it's in your repo. Error: {e}")
         return None
 
-def listen_and_transcribe(r, status_placeholder, vosk_model):
-    with sr.Microphone() as source:
-        r.adjust_for_ambient_noise(source, duration=0.5)
-        status_placeholder.info("🎙️ Listening... Speak now!")
-        try:
-            audio = r.listen(source, timeout=10, phrase_time_limit=15)
-            status_placeholder.info("🧠 Processing with Speech-To-Text model...")
-            raw_data = audio.get_raw_data(convert_rate=16000, convert_width=2)
-            recognizer = KaldiRecognizer(vosk_model, 16000)
-            if recognizer.AcceptWaveform(raw_data):
-                result_json = recognizer.Result()
-                result_dict = json.loads(result_json)
-                text = result_dict.get("text", "")
-                if text:
-                    status_placeholder.success("✅ Transcription Complete!")
-                    time.sleep(1)
-                    return text.lower()
-            partial_json = recognizer.PartialResult()
-            partial_dict = json.loads(partial_json)
-            partial_text = partial_dict.get("partial", "")
-            if partial_text:
-                status_placeholder.success("✅ Transcription Complete!")
-                time.sleep(1)
-                return partial_text.lower()
-            status_placeholder.warning("🤔 No clear speech detected.")
-            return None
-        except sr.WaitTimeoutError:
-            status_placeholder.warning("👂 Listening timed out. No speech was detected.")
-            return None
-        except Exception as e:
-            st.error(f"An error occurred during transcription: {e}")
-            return None
+vosk_model = load_vosk_model()
 
-def generate_response(client, user_text):
-    st.info("💡 Getting response from AI...")
-    system_prompt = "You are a helpful and friendly voice assistant. Your name is AI. Keep your responses concise, conversational, and suitable for being spoken aloud."
+# Groq API Client
+try:
+    api_key = st.secrets["GROQ_API_KEY"]
+    client = Groq(api_key=api_key)
+except KeyError:
+    st.error("Groq API key not found. Please add it to your Streamlit secrets.")
+    st.stop()
+
+# --- SESSION STATE ---
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "audio_buffer" not in st.session_state:
+    st.session_state.audio_buffer = b""
+if "transcribed_text" not in st.session_state:
+    st.session_state.transcribed_text = ""
+if "processing" not in st.session_state:
+    st.session_state.processing = False
+
+# --- AUDIO & AI FUNCTIONS ---
+
+def text_to_audio_autoplay(text):
+    """Converts text to an audio file and returns HTML for autoplaying it."""
+    try:
+        tts = gTTS(text=text, lang='en')
+        mp3_fp = io.BytesIO()
+        tts.write_to_fp(mp3_fp)
+        mp3_fp.seek(0)
+        # Encode to base64
+        b64 = base64.b64encode(mp3_fp.read()).decode()
+        # Create the HTML audio player
+        audio_html = f"""
+            <audio autoplay="true">
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+            </audio>
+            """
+        return audio_html
+    except Exception as e:
+        st.error(f"Error in TTS generation: {e}")
+        return None
+
+def generate_response(user_text):
+    system_prompt = "You are a helpful and friendly voice assistant. Keep your responses concise and conversational."
     try:
         chat_completion = client.chat.completions.create(
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}],
-            model="llama3-8b-8192", temperature=0.7, max_tokens=250)
-        response = chat_completion.choices[0].message.content
-        st.success("✅ AI response received!")
-        time.sleep(1)
-        return response
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text}
+            ],
+            model="llama3-8b-8192",
+            temperature=0.7, max_tokens=250,
+        )
+        return chat_completion.choices[0].message.content
     except Exception as e:
-        st.error(f"An error occurred with the AI API: {e}")
-        return "I'm sorry, I'm having trouble connecting to my brain right now."
+        st.error(f"Error with Groq API: {e}")
+        return "Sorry, I'm having trouble connecting to my brain right now."
 
+# --- WEBRTC AUDIO PROCESSOR ---
 
-# --- Main Application Logic ---
-# It's good practice to wrap the main app logic in a function and use a __name__ == "__main__" block
-def main():
-    st.set_page_config(layout="wide", page_title="Conversational AI", page_icon="🎙️")
+class AudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self.audio_buffer = b""
+        self.vosk_recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
 
-    # Initialize session state
-    if 'history' not in st.session_state:
+    def recv(self, frame):
+        # The frame comes from the browser. Convert it to the right format for Vosk.
+        # This assumes the browser sends audio at 48kHz. We'll downsample to 16kHz.
+        try:
+            audio = pydub.AudioSegment.from_raw(
+                io.BytesIO(frame.to_ndarray().tobytes()),
+                sample_width=frame.format.bytes,
+                frame_rate=frame.sample_rate,
+                channels=len(frame.layout.channels),
+            )
+            audio = audio.set_channels(1).set_frame_rate(16000)
+            
+            # Append to buffer if recording is active
+            if st.session_state.get("is_recording", False):
+                st.session_state.audio_buffer += audio.raw_data
+
+        except Exception as e:
+            st.error(f"Error processing audio frame: {e}")
+        
+        return frame
+
+# --- STREAMLIT UI ---
+
+st.set_page_config(layout="wide", page_title="AI Voice Assistant (Cloud)")
+
+# --- UI for Title and Clear Chat Button ---
+col1, col2 = st.columns([5, 1])
+with col1:
+    st.title("️🎙️ AI Voice Assistant (Cloud Version)")
+    st.markdown("This version runs on the cloud. Click 'Start Recording' and allow microphone access.")
+with col2:
+    if st.button("Clear Chat 🗑️", use_container_width=True):
         st.session_state.history = []
+        st.session_state.transcribed_text = ""
+        st.rerun()
 
-    # Load resources
-    vosk_model = load_vosk_model()
-    if vosk_model is None:
-        st.stop()
-    
-    try:
-        api_key = st.secrets["GROQ_API_KEY"]
-        client = Groq(api_key=api_key)
-    except KeyError:
-        st.error("AI API key not found. Please add it to your Streamlit secrets.")
-        st.stop()
+# Display conversation history
+for user_msg, ai_msg in st.session_state.history:
+    with st.chat_message("user"):
+        st.write(user_msg)
+    with st.chat_message("assistant"):
+        st.write(ai_msg)
 
-    r = sr.Recognizer()
+# Placeholder for status and audio player
+status_placeholder = st.empty()
+audio_player_placeholder = st.empty()
 
-    # UI for Title and Clear Chat Button
-    col1, col2 = st.columns([5, 1])
-    with col1:
-        st.title("️🎙️ Conversational AI")
-        st.markdown("Your offline-first voice companion.")
-    with col2:
-        if st.button("Clear Chat 🗑️", use_container_width=True):
-            st.session_state.history = []
+# The WebRTC component that accesses the microphone
+# It's always "running" in the background, but we control data collection with a session state flag.
+webrtc_ctx = webrtc_streamer(
+    key="audio-recorder",
+    mode=WebRtcMode.SEND_ONLY,
+    audio_processor_factory=AudioProcessor,
+    media_stream_constraints={"video": False, "audio": True},
+)
+
+# --- Main Interaction Logic ---
+# Control buttons
+c1, c2 = st.columns(2)
+with c1:
+    if not st.session_state.get("is_recording", False):
+        if st.button("🎤 Start Recording", type="primary", use_container_width=True):
+            st.session_state.is_recording = True
+            st.session_state.audio_buffer = b"" # Reset buffer
+            st.rerun()
+    else:
+        if st.button("🛑 Stop Recording", type="secondary", use_container_width=True):
+            st.session_state.is_recording = False
+            st.session_state.processing = True
             st.rerun()
 
-    # Display conversation history
-    for user_msg, ai_msg in st.session_state.history:
-        with st.chat_message("user"):
-            st.write(user_msg)
-        with st.chat_message("assistant"):
-            st.write(ai_msg)
+if st.session_state.get("is_recording", False):
+    status_placeholder.info("🎙️ Recording... Click 'Stop Recording' when you're done.")
 
-    # Placeholder for status messages
-    status_placeholder = st.empty()
+# This block runs AFTER "Stop Recording" is clicked
+if st.session_state.get("processing", False):
+    with status_placeholder.container():
+        with st.spinner("Transcribing your speech..."):
+            if st.session_state.audio_buffer and vosk_model:
+                recognizer = vosk.KaldiRecognizer(vosk_model, 16000)
+                recognizer.AcceptWaveform(st.session_state.audio_buffer)
+                result_json = recognizer.FinalResult()
+                result_dict = json.loads(result_json)
+                st.session_state.transcribed_text = result_dict.get("text", "").strip()
+            else:
+                st.session_state.transcribed_text = ""
 
-    # Main Interaction Logic
-    if st.button("🎤 Start Speaking", type="primary", use_container_width=True):
-        user_input = listen_and_transcribe(r, status_placeholder, vosk_model)
-        
-        if user_input:
-            status_placeholder.empty()
-            ai_response = generate_response(client, user_input)
-            status_placeholder.empty()
-
-            # Update history and UI, then speak
-            st.session_state.history.append((user_input, ai_response))
+        if st.session_state.transcribed_text:
+            st.success(f"Transcription: '{st.session_state.transcribed_text}'")
+            with st.spinner("Generating AI response..."):
+                ai_response = generate_response(st.session_state.transcribed_text)
             
-            # Launch the TTS in a separate process
-            speak_text(ai_response)
+            # Add to history and generate audio
+            st.session_state.history.append((st.session_state.transcribed_text, ai_response))
+            audio_html = text_to_audio_autoplay(ai_response)
+            if audio_html:
+                audio_player_placeholder.markdown(audio_html, unsafe_allow_html=True)
             
-            # Rerun to display the new messages immediately
+            # Reset states for the next turn
+            st.session_state.transcribed_text = ""
+            st.session_state.audio_buffer = b""
+            st.session_state.processing = False
+            time.sleep(1) # Give a moment for audio to start playing
             st.rerun()
         else:
-            status_placeholder.empty()
+            st.warning("No speech was detected. Please try recording again.")
+            st.session_state.processing = False
+            time.sleep(2)
+            st.rerun()
 
-# This block is crucial for multiprocessing to work reliably on all platforms
-if __name__ == "__main__":
-    # On Windows, the 'spawn' start method is the default. This is needed.
-    multiprocessing.freeze_support() 
-    main()
+# Sidebar Information
+st.sidebar.header("About")
+st.sidebar.info(
+    "This app uses a web-friendly architecture:\n"
+    "1. **Mic Access:** `streamlit-webrtc` (in browser)\n"
+    "2. **Speech-to-Text:** `Vosk` (on server)\n"
+    "3. **LLM Inference:** `Groq API`\n"
+    "4. **Text-to-Speech:** `gTTS` (generates audio on server)\n"
+    "5. **Audio Playback:** HTML5 Audio (in browser)"
+)
