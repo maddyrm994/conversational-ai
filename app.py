@@ -14,7 +14,6 @@ import av
 # --- INITIALIZATION & SETUP ---
 
 # Use a thread-safe queue to pass audio frames from the WebRTC thread to the main thread.
-# We need to check if the queue already exists in the session state to avoid re-creating it on every run.
 if "audio_frames_queue" not in st.session_state:
     st.session_state.audio_frames_queue = queue.Queue()
 
@@ -118,14 +117,13 @@ audio_player_placeholder = st.empty()
 # The WebRTC component that accesses the microphone
 webrtc_ctx = webrtc_streamer(
     key="audio-recorder",
-    # THIS IS THE CORRECTED LINE:
     mode=WebRtcMode.SENDONLY,
     audio_processor_factory=AudioProcessor,
     client_settings=ClientSettings(
         rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
         media_stream_constraints={"video": False, "audio": True},
     ),
-    send_interval=200, # Send audio chunks every 200ms
+    # The 'send_interval' argument has been removed from this call
 )
 
 if webrtc_ctx.state.playing and not st.session_state.run_conversation:
