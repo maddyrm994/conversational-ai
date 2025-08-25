@@ -1,4 +1,4 @@
-streamlit
+streamlit==1.22.0
 groq
 vosk
 streamlit-webrtc==0.47.0
