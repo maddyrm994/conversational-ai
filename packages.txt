@@ -1,6 +1,4 @@
-# For PyAudio to compile
+build-essential
 portaudio19-dev
-# For pyttsx3 to speak on Linux
-espeak
-# A common audio/video utility that can be useful
+espeak-ng
 ffmpeg
